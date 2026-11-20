@@ -1,0 +1,2 @@
+pytest -m slow -k 'shared_prefix or tokenize_query_once' unit/test_rerank.py, server: all
+11 passed, 18 deselected in 48.42s

@@ -2,6 +2,8 @@
 
 Each request is one query with N candidates from the chosen partition, cycling through the queries in a
 fixed shuffled order. Latency is measured from the scheduled arrival time to the end of the response.
+achieved_rps is the number of successful requests divided by the time from the first arrival to the last
+response, i.e. the arrival window plus the time to drain the queue; under overload it approaches the capacity.
 
 usage: python3 -I openloop.py --cases cases.jsonl --partition holdout --n 32 --rates 2 3 4 \
            --seconds 30 --port 8090 --out result.jsonl
@@ -11,6 +13,7 @@ import http.client
 import json
 import math
 import random
+import statistics
 import threading
 import time
 from collections import defaultdict
@@ -86,7 +89,7 @@ def main():
             elapsed = time.perf_counter() - start
             ok = [ms for status, ms in results if status == 200]
             row = dict(rate=rate, sent=len(arrivals), ok=len(ok), errors=len(arrivals) - len(ok),
-                       achieved_rps=len(ok) / elapsed, p50_ms=sorted(ok)[len(ok) // 2] if ok else None,
+                       achieved_rps=len(ok) / elapsed, p50_ms=statistics.median(ok) if ok else None,
                        p95_ms=p95(ok) if ok else None)
             print(json.dumps(row), flush=True)
             output.write(json.dumps(row) + "\n")

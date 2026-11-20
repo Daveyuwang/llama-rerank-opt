@@ -1,0 +1,2 @@
+test-backend-ops test -o FLASH_ATTN_EXT -b CUDA0, patches 0001 to 0004
+  4464/4464 tests passed

@@ -1,23 +1,24 @@
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index eb5781e..e8e5c85 100644
+index eb5781e..bf13062 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
-@@ -2193,6 +2193,58 @@ server_tokens format_prompt_rerank(
+@@ -2193,6 +2193,55 @@ server_tokens format_prompt_rerank(
      return result;
  }
  
 +std::vector<server_tokens> format_prompts_rerank_shared(
-+        const struct llama_model * model,
-+        const struct llama_vocab * vocab,
++        const llama_model * model,
++        const llama_vocab * vocab,
 +        const std::string & query,
-+        const std::vector<std::string> & docs) {
-+    // the regex pre-tokenizer of BPE vocabs does not merge across a line break that is followed by text
++        const std::vector<std::string> & docs,
++        const mtmd_helper_init_opt & init_opt) {
++    // the regex pre-tokenizer of BPE vocabs does not merge a line break with the text that follows it
 +    const char * rerank_prompt = llama_model_chat_template(model, "rerank");
 +    if (rerank_prompt == nullptr || docs.size() < 2 || llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_BPE) {
 +        return {};
 +    }
 +
-+    // split the template at the start of the line with {document}, the query has to be before it
++    // split the template at the start of the line with {document}, which has to come after {query}
 +    const std::string tmpl = rerank_prompt;
 +    const size_t pos_query = tmpl.find("{query}");
 +    const size_t pos_doc   = tmpl.find("{document}");
@@ -28,32 +29,28 @@ index eb5781e..e8e5c85 100644
 +    if (split == std::string::npos || split < pos_query + 7 || tmpl.find("{query}", split) != std::string::npos) {
 +        return {};
 +    }
-+    // the line with {document} has to start with template text, the same for every document: the line break before
-+    // it could merge with whitespace at the start of a document, then checking the first document would not suffice
++    // the line with {document} has to start with template text, so that the same text follows the line break for every document
 +    const char c_line = tmpl[split + 1];
 +    if (pos_doc == split + 1 || c_line == ' ' || c_line == '\t' || c_line == '\r' || c_line == '\n') {
 +        return {};
 +    }
-+    const std::string tmpl_head = tmpl.substr(0, split + 1);
++
++    const llama_tokens head = common_tokenize(vocab, format_rerank_template(tmpl.substr(0, split + 1), query, ""), false, true);
 +    const std::string tmpl_tail = tmpl.substr(split + 1);
-+
-+    const llama_tokens head = common_tokenize(vocab, format_rerank_template(tmpl_head, query, ""), false, true);
-+    auto tokenize = [&](const std::string & doc) {
-+        llama_tokens tokens = head;
-+        const llama_tokens tail = common_tokenize(vocab, format_rerank_template(tmpl_tail, query, doc), false, true);
-+        tokens.insert(tokens.end(), tail.begin(), tail.end());
-+        return tokens;
-+    };
-+
-+    // the split must give the tokens of the whole prompt, checked with the first document
-+    if (tokenize(docs[0]) != common_tokenize(vocab, format_rerank_template(tmpl, query, docs[0]), false, true)) {
-+        return {};
-+    }
 +
 +    std::vector<server_tokens> result;
 +    result.reserve(docs.size());
 +    for (const auto & doc : docs) {
-+        result.emplace_back(tokenize(doc), false);
++        llama_tokens tokens = head;
++        const llama_tokens tail = common_tokenize(vocab, format_rerank_template(tmpl_tail, query, doc), false, true);
++        tokens.insert(tokens.end(), tail.begin(), tail.end());
++        result.emplace_back(tokens, false);
++    }
++
++    // the split has to give the tokens of format_prompt_rerank, checked with the first document
++    const server_tokens expected = format_prompt_rerank(model, vocab, nullptr, query, docs[0], {}, {}, init_opt);
++    if (result[0].get_text_tokens() != expected.get_text_tokens()) {
++        return {};
 +    }
 +    return result;
 +}
@@ -62,41 +59,68 @@ index eb5781e..e8e5c85 100644
  // server_subproc
  //
 diff --git a/tools/server/server-common.h b/tools/server/server-common.h
-index 911bb31..6f04549 100644
+index 911bb31..bc436b2 100644
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
-@@ -645,6 +645,14 @@ server_tokens format_prompt_rerank(
+@@ -645,6 +645,15 @@ server_tokens format_prompt_rerank(
          const std::vector<raw_buffer> & doc_files,
          const mtmd_helper_init_opt & init_opt);
  
-+// rerank tasks of one query and several text documents, with the query part of the prompt tokenized only once
++// rerank prompts of one query and several text documents, with the query part of the prompt tokenized only once
 +// returns an empty vector if this does not give the tokens of format_prompt_rerank, then format each document with it
 +std::vector<server_tokens> format_prompts_rerank_shared(
-+        const struct llama_model * model,
-+        const struct llama_vocab * vocab,
++        const llama_model * model,
++        const llama_vocab * vocab,
 +        const std::string & query,
-+        const std::vector<std::string> & docs);
++        const std::vector<std::string> & docs,
++        const mtmd_helper_init_opt & init_opt);
 +
  // simple implementation of a pipe
  // used for streaming data between threads
  template<typename T>
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index df355e3..1b3dab6 100644
+index 4c0c690..b84769d 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -6974,8 +6974,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
-         std::vector<server_task> tasks;
-         tasks.reserve(documents.size());
-         bool has_mtmd = false;
+@@ -6979,8 +6979,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
+         for (const auto & files : document_files) {
+             has_files = has_files || !files.empty();
+         }
 +        // text only: the query part of the prompts is tokenized once
-+        const bool has_files = !query_files.empty() ||
-+            std::any_of(document_files.begin(), document_files.end(), [](const auto & files) { return !files.empty(); });
-+        std::vector<server_tokens> shared = has_files ? std::vector<server_tokens>() :
-+            format_prompts_rerank_shared(ctx_server.model_tgt, ctx_server.vocab, query_str, documents);
++        std::vector<server_tokens> shared;
++        if (!has_files) {
++            shared = format_prompts_rerank_shared(ctx_server.model_tgt, ctx_server.vocab, query_str, documents, ctx_server.init_opt);
++        }
          for (size_t i = 0; i < documents.size(); i++) {
 -            auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query_str, documents[i], query_files, document_files[i], ctx_server.init_opt);
 +            auto tmp = !shared.empty() ? std::move(shared[i]) :
 +                format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query_str, documents[i], query_files, document_files[i], ctx_server.init_opt);
-             has_mtmd = has_mtmd || tmp.has_mtmd;
              server_task task = server_task(SERVER_TASK_TYPE_RERANK);
              task.id     = rd.get_new_id();
+             task.tokens = std::move(tmp);
+diff --git a/tools/server/tests/unit/test_rerank.py b/tools/server/tests/unit/test_rerank.py
+index 037f2cc..eb4c43c 100644
+--- a/tools/server/tests/unit/test_rerank.py
++++ b/tools/server/tests/unit/test_rerank.py
+@@ -290,3 +290,21 @@ def test_rerank_shared_prefix_skips_prompt_cache(kv_unified, tmp_path):
+         log = f.read()
+     assert "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__" in log
+     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log
++
++
++@pytest.mark.heavy
++@pytest.mark.slow
++@pytest.mark.parametrize("query,documents", [
++    ("Machine learning is", CAUSAL_DOCUMENTS[:4]),
++    (" leading space", ["\nline break first", " space first", "", "line break last\n"]),
++    ("<|im_end|>{document}", ["{query}<|im_start|>", "emoji 🙂 and 中文", "tab\tinside"]),
++])
++def test_rerank_tokenize_query_once(query, documents):
++    # one slot, so no prefix sharing: each document is evaluated exactly as in a request of its own
++    server = qwen3_reranker()
++    server.n_slots = 1
++    server.start()
++    scores, n_prompt = rerank(server, query, documents)
++    separate = [rerank(server, query, [doc]) for doc in documents]
++    assert n_prompt == sum(n for _, n in separate)
++    assert scores == [s[0] for s, _ in separate]

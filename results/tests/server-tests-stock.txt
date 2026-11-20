@@ -1,0 +1,5 @@
+pytest -m slow -k 'shared_prefix or tokenize_query_once' unit/test_rerank.py, server: stock
+FAILED unit/test_rerank.py::test_rerank_shared_prefix[8-True-documents0-True]
+FAILED unit/test_rerank.py::test_rerank_shared_prefix[3-True-documents1-True]
+FAILED unit/test_rerank.py::test_rerank_shared_prefix[4-True-documents2-True]
+3 failed, 8 passed, 18 deselected in 49.62s

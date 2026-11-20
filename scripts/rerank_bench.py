@@ -1,15 +1,17 @@
-"""Prepare the ToolRet rerank workload and measure a llama-server /v1/rerank endpoint.
+"""Prepare the ToolRet rerank workload and measure a /v1/rerank endpoint.
 
 prepare: read the metatool and apibank queries of ToolRet from the Hugging Face datasets server and write 20 cases
     per domain. A case holds the labelled positives plus the most similar other tools of the domain (word overlap),
     32 candidates in all, and fixed shuffled candidate orders for N = 1, 8 and 32.
 run: send every case at every size once per round, in a shuffled order, one request at a time, and write one JSON
     line per request with the latency, the scores and nDCG@10. The two partitions take alternate cases of each
-    domain (dev: even, holdout: odd).
+    domain (dev: even, holdout: odd). With --qwen3-template the client applies the Qwen3-Reranker prompt template,
+    which llama-server takes from the GGUF file, for servers that score the query and document texts joined as
+    they are (vLLM).
 
 usage: python3 -I rerank_bench.py prepare --out data/cases.jsonl
-       python3 -I rerank_bench.py run --cases data/cases.jsonl --partition holdout --mode batch --rounds 5 \
-           --port 8090 --out run.jsonl
+       python3 -I rerank_bench.py run --cases data/cases.jsonl --partition holdout --rounds 5 --port 8090 \
+           --out run.jsonl
 """
 import argparse
 import hashlib
@@ -26,6 +28,12 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
+
+# the rerank template of the Qwen3-Reranker GGUF files (tokenizer.chat_template.rerank)
+QWEN3_TEMPLATE = ('<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the '
+                  'Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
+                  '<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n'
+                  '<Query>: {query}\n<Document>: {document}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n')
 
 
 def fetch_json(url, attempts=8):
@@ -103,7 +111,10 @@ def prepare(count):
     return cases
 
 
-def request_scores(conn, query, docs):
+def request_scores(conn, query, docs, template):
+    if template:
+        head, tail = QWEN3_TEMPLATE.split("{document}")
+        query, docs = head.replace("{query}", query), [doc + tail for doc in docs]
     body = json.dumps(dict(query=query, documents=docs, top_n=len(docs)),
                       ensure_ascii=False).encode("utf-8")
     conn.request("POST", "/v1/rerank", body=body, headers={"Content-Type": "application/json"})
@@ -120,14 +131,10 @@ def request_scores(conn, query, docs):
     return scores
 
 
-def evaluate(conn, case, n, mode):
+def evaluate(conn, case, n, template):
     docs = [case["candidates"][i] for i in case["orders"][str(n)]]
-    texts = [doc["text"] for doc in docs]
     start = time.perf_counter()
-    if mode == "one-by-one":
-        scores = [request_scores(conn, case["query"], [doc])[0] for doc in texts]
-    else:
-        scores = request_scores(conn, case["query"], texts)
+    scores = request_scores(conn, case["query"], [doc["text"] for doc in docs], template)
     ms = (time.perf_counter() - start) * 1000
     by_id = {doc["id"]: score for doc, score in zip(docs, scores)}
     ranked = sorted(by_id, key=lambda k: (-by_id[k], k))
@@ -152,18 +159,17 @@ def run(args):
         raise ValueError("Need at least one case and one round")
     conn = http.client.HTTPConnection(args.host, args.port, timeout=120)
     try:
-        for n in args.sizes:
-            evaluate(conn, cases[0], n, args.mode)
         latency = defaultdict(list)
         quality = defaultdict(list)
-        digest = hashlib.sha256(workload_bytes).hexdigest()
+        # the hash of the file with LF line endings, as prepare writes it
+        digest = hashlib.sha256(workload_bytes.replace(b"\r\n", b"\n")).hexdigest()
         with args.out.open("x", encoding="utf-8") as output:
             for repeat in range(args.rounds):
                 schedule = [(case, n) for case in cases for n in args.sizes]
                 random.Random(48 + repeat).shuffle(schedule)
                 for case, n in schedule:
-                    row = evaluate(conn, case, n, args.mode)
-                    row.update(repeat=repeat, mode=args.mode, workload_sha256=digest)
+                    row = evaluate(conn, case, n, args.qwen3_template)
+                    row.update(repeat=repeat, workload_sha256=digest)
                     print(json.dumps(row, separators=(",", ":")), file=output, flush=True)
                     latency[n].append(row["ms"])
                     if row["ndcg"] is not None:
@@ -185,7 +191,7 @@ if __name__ == "__main__":
     prep.add_argument("--out", type=Path, required=True)
     bench = subs.add_parser("run")
     bench.add_argument("--cases", type=Path, required=True)
-    bench.add_argument("--mode", choices=("one-by-one", "batch"), required=True)
+    bench.add_argument("--qwen3-template", action="store_true")
     bench.add_argument("--port", type=int, default=8090)
     bench.add_argument("--host", default="127.0.0.1")
     bench.add_argument("--rounds", type=int, default=3)

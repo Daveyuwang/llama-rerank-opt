@@ -1,0 +1,23 @@
+== session 1: stock
+{"n": 32, "batches": 20, "p50_ms": 186.41090150003947, "p95_ms": 226.6764119999607, "candidates_per_active_second": 211.3598717763651, "ndcg10": 0.7573501145191861}
+prompt tokens processed in the measured rounds: about 141550.0
+== session 1: server
+{"n": 32, "batches": 20, "p50_ms": 109.21269350001239, "p95_ms": 176.74560600016775, "candidates_per_active_second": 294.73705119406856, "ndcg10": 0.7582435373465664}
+prompt tokens processed in the measured rounds: about 81720.0
+== session 1: all
+{"n": 32, "batches": 20, "p50_ms": 88.85659700001725, "p95_ms": 146.98700400003872, "candidates_per_active_second": 344.9014939884106, "ndcg10": 0.7589767153447277}
+prompt tokens processed in the measured rounds: about 81720.0
+== stock -> server
+A = stock.jsonl
+B = server.jsonl
+  N scope      A P50   B P50   A P95   B P95  P95 chg            95% CI thru chg max|ds| p95|ds|  top1   dNDCG
+ 32 all        186.4   109.2   226.7   176.7   -22.0% [ -27.9%,  -9.2%]    39.4%  0.0543  0.0019  1.00  0.0009
+ 32 metatool    93.8    49.6   194.7    62.3   -68.0% [ -71.1%, -41.7%]   101.6%  0.0360  0.0003  1.00  0.0018
+ 32 apibank    193.2   166.7   231.9   179.2   -22.7% [ -24.4%, -11.5%]    20.5%  0.0543  0.0041  1.00  0.0000
+== stock -> all
+A = stock.jsonl
+B = all.jsonl
+  N scope      A P50   B P50   A P95   B P95  P95 chg            95% CI thru chg max|ds| p95|ds|  top1   dNDCG
+ 32 all        186.4    88.9   226.7   147.0   -35.2% [ -38.1%, -24.2%]    63.2%  0.0421  0.0022  1.00  0.0016
+ 32 metatool    93.8    44.8   194.7    55.0   -71.8% [ -75.7%, -45.1%]   122.4%  0.0245  0.0001  1.00  0.0000
+ 32 apibank    193.2   139.7   231.9   147.6   -36.3% [ -36.8%, -25.8%]    43.7%  0.0421  0.0041  1.00  0.0033

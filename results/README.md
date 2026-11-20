@@ -1,19 +1,24 @@
 # Recorded results
 
-Build names: `stock` is llama.cpp at the base commit; `all` is patches 0001 to 0004; `0001` is that patch alone;
-`all+0005` adds the optional slot reservation. The section numbers refer to `docs/report.md`.
+All measurements ran on llama.cpp b94959a with the patches in this repository, on an RTX 5080 under WSL2. Server
+names: `stock` is the base; `all` is patches 0001 to 0004; `server` is 0001 and 0002; `cuda` is 0003 and 0004; `wt`
+is 0004 alone; `vllm` is vLLM 0.34.0 with its default prefix caching and `vllm-noapc` without it. For the kernel
+A/B, `stock` carries the test part of 0003. The section numbers refer to `docs/report.md`.
 
-| Path | Base | Content | Report |
-| --- | --- | --- | --- |
-| `ab-holdout/stock-vs-all.json` | b94959a | held-out A/B, stock against 0001 to 0004 (`scripts/ab_compare.py` output) | 4.1 |
-| `ab-holdout/stock-vs-0001.json` | b94959a | the same for 0001 alone, separate session | 4.1 |
-| `ab-holdout/runs/` | b94959a | pooled raw runs behind the two files above: `stock-a` with `all`, `stock-b` with `0001`; one JSON line per request (query id, N, latency in ms, score per candidate, nDCG@10, round) | 4.1 |
-| `kernel/` | b94959a | FA kernel A/B (`scripts/fa_kernel_ab.sh`, 6 rotated repetitions): `fa-kernel.log` has one line per run (build, repetition, K/V length, queries, sequences, prefix, us per run), `summary.txt` the table. Here `stock` is the base plus the test part of 0003 and `patched` is 0001 to 0004 | 4.6 |
-| `openloop/` | b94959a | open loop, stock and `all`, one JSON line per arrival rate (`scripts/openloop.sh`) | 4.4 |
-| `prefill/` | b94959a | llama-bench prefill, 8 rotated rounds: `stock-b94959a`, `wt-b94959a` (0004 alone) and `patch-b94959a` (0001 to 0004) | 4.7 |
-| `mixed/` | b94959a | four mixed-load runs at 30 N=8 requests per second, `all` against `all+0005`; run 4 also has the same two builds on e4b620a | 4.5 |
-| `e4b620a/*.json` | e4b620a | held-out A/B on the earlier base: `stock-vs-server` (0001), `stock-vs-cuda` (0003 and 0004), `server-vs-all`, `stock-vs-all`; prefixed `ub512-` with `-ub 512` and `defaults-` with the server defaults | 4.2, 4.3 |
-| `e4b620a/mixed/` | e4b620a | mixed load, stock against `all` at 10 to 40 N=8 requests per second; `reserve-` files: `all` against `all+0005` | 4.5 |
+| Path | Content | Report |
+| --- | --- | --- |
+| `ab-holdout/runs/` | pooled held-out runs of stock, all, server, cuda and vllm: one JSON line per request (query id, N, latency in ms, score per candidate, nDCG@10, round, workload hash) | 4.1 to 4.3 |
+| `ab-holdout/ab-*.json` | `scripts/ab_compare.py` summaries: each server against stock, and all against vllm | 4.1 to 4.3 |
+| `ab-holdout/log.txt` | console output of the A/B, with the prompt tokens processed per session | 4.1 |
+| `ab-holdout/prompt-tokens-n32.txt` | prompt tokens processed in one round of N=32 requests | 4.1 |
+| `configs/` | A/B summaries of other configurations: `-ub 512`, the server defaults, split KV with and without prefix sharing, vLLM without prefix caching | 4.3, 4.5 |
+| `model-4b/` | A/B summaries with Qwen3-Reranker-4B | 4.4 |
+| `openloop/` | open loop of stock and all, one JSON line per arrival rate | 4.6 |
+| `mixed/` | mixed load of stock and all, one file per server, N=8 rate and request size; `log.txt` has the table | 4.7 |
+| `kernel/` | FA kernel A/B: `fa-kernel.log` has one line per run (build, repetition, K/V length, queries, sequences, prefix, us per run), `summary.txt` the table | 4.8 |
+| `prefill/` | llama-bench prefill of stock, wt and all with `-ub 2048` and `-ub 512`: one JSON line per build, round and prompt length; the `.txt` files have the tables | 4.9 |
+| `tests/` | summary lines of the FA tests and the server tests | 6 |
 
-In the A/B summaries, `a_*` is the first build and `b_*` the second; `p95_change` and `throughput_change` are
-fractions, and `p95_change_ci` is the 95% bootstrap interval of the P95 change.
+In the A/B summaries, `a_*` is the first server and `b_*` the second; `p95_change` and `throughput_change` are
+fractions, `p95_change_ci` is the 95% bootstrap interval of the P95 change, and `ndcg_delta` is null for N=1, which
+has no ranking.

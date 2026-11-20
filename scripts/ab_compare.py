@@ -3,10 +3,9 @@
 Latency: P50, P95 and throughput for each candidate count N, overall and per domain, with a bootstrap 95% interval
 for the P95 change that resamples queries (all rounds of a query move together). Throughput is total A time over
 total B time, since requests are sent one at a time. Scores: largest and P95 absolute difference, top-1 agreement
-and nDCG@10 change.
+and nDCG@10 change. The domain of a query is the prefix of its id (metatool_..., apibank_...).
 
-usage: python3 -I ab_compare.py A.jsonl B.jsonl [--out result.json] [--cases cases.jsonl]
-Without --cases the domain is the prefix of the query id (metatool_..., apibank_...).
+usage: python3 -I ab_compare.py A.jsonl B.jsonl [--out result.json]
 """
 import argparse
 import json
@@ -33,25 +32,17 @@ def top(scores):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--cases", type=Path)
     parser.add_argument("reference", type=Path)
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--boot", type=int, default=2000)
     args = parser.parse_args()
-    domain = {}
-    if args.cases:
-        for line in args.cases.read_text(encoding="utf-8-sig").splitlines():
-            if line.strip():
-                case = json.loads(line)
-                domain[case["id"]] = case["domain"]
-
-    def domain_of(query_id):
-        return domain.get(query_id) or query_id.split("_", 1)[0]
-
     a, b = load(args.reference), load(args.candidate)
     if a.keys() != b.keys():
         raise SystemExit("runs differ in workload, sizes or rounds")
+    hashes = {row.get("workload_sha256") for run in (a, b) for row in run.values()}
+    if len(hashes) != 1:
+        raise SystemExit(f"runs come from different workload files: {sorted(map(str, hashes))}")
 
     report = {}
     print(f"A = {args.reference.name}\nB = {args.candidate.name}")
@@ -60,7 +51,7 @@ def main():
     rng = random.Random(48)
     for n in sorted({k[1] for k in a}):
         for scope in ("all", "metatool", "apibank"):
-            keys = [k for k in a if k[1] == n and (scope == "all" or domain_of(k[0]) == scope)]
+            keys = [k for k in a if k[1] == n and scope in ("all", k[0].split("_", 1)[0])]
             if not keys:
                 continue
             la = [a[k]["ms"] for k in keys]
@@ -80,10 +71,10 @@ def main():
             diffs = [abs(a[k]["scores"][d] - b[k]["scores"][d]) for k in keys for d in a[k]["scores"]]
             top1 = sum(top(a[k]["scores"]) == top(b[k]["scores"]) for k in keys) / len(keys)
             ndcg = [b[k]["ndcg"] - a[k]["ndcg"] for k in keys if a[k]["ndcg"] is not None]
-            dndcg = statistics.fmean(ndcg) if ndcg else float("nan")
+            dndcg = statistics.fmean(ndcg) if ndcg else None  # N=1 has no nDCG
             print(f"{n:>3} {scope:8} {statistics.median(la):7.1f} {statistics.median(lb):7.1f} {p95(la):7.1f} "
                   f"{p95(lb):7.1f} {change:8.1%} [{low:7.1%},{high:7.1%}] {thru:8.1%} {max(diffs):7.4f} "
-                  f"{p95(diffs):7.4f} {top1:5.2f} {dndcg:7.4f}")
+                  f"{p95(diffs):7.4f} {top1:5.2f} {'' if dndcg is None else f'{dndcg:7.4f}':>7}")
             report[f"N{n}/{scope}"] = dict(
                 samples=len(keys), a_p50=statistics.median(la), b_p50=statistics.median(lb), a_p95=p95(la),
                 b_p95=p95(lb), p95_change=change, p95_change_ci=[low, high], throughput_change=thru,

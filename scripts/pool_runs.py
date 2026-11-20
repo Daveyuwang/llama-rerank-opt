@@ -9,10 +9,13 @@ from pathlib import Path
 
 def main():
     out, runs = Path(sys.argv[1]), [Path(p) for p in sys.argv[2:]]
+    loaded = [[json.loads(line) for line in run.read_text(encoding="utf-8").splitlines() if line.strip()] for run in runs]
+    hashes = {row.get("workload_sha256") for rows in loaded for row in rows}
+    if len(hashes) != 1:
+        raise SystemExit(f"runs come from different workload files: {sorted(map(str, hashes))}")
     offset = 0
     with out.open("x", encoding="utf-8") as handle:
-        for run in runs:
-            rows = [json.loads(line) for line in run.read_text(encoding="utf-8").splitlines() if line.strip()]
+        for rows in loaded:
             for row in rows:
                 row["repeat"] += offset
                 handle.write(json.dumps(row, separators=(",", ":")) + "\n")

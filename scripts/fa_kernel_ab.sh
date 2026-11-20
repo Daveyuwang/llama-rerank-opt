@@ -24,9 +24,14 @@ for ((rep = 0; rep < reps; rep++)); do
     for re in "${cases[@]}"; do
         for ((i = 0; i < ${#names[@]}; i++)); do
             k=$(((i + rep) % ${#names[@]}))
-            "${bins[$k]}" perf -o FLASH_ATTN_EXT -b CUDA0 -p "$re" 2>&1 | grep -E 'n_seq_diag' |
-                sed -E 's/.*kv=([0-9]+),nb=([0-9]+),.*n_seq_diag=([0-9]+),n_prefix_diag=([0-9]+)\):[^0-9]*[0-9]+ runs - +([0-9.]+) us\/run.*/\1 \2 \3 \4 \5/' |
-                awk -v b="${names[$k]}" -v r="$rep" '{print b, r, $0}' >> "$log"
+            out=$("${bins[$k]}" perf -o FLASH_ATTN_EXT -b CUDA0 -p "$re" 2>&1 || true)
+            rows=$(sed -nE 's/.*kv=([0-9]+),nb=([0-9]+),.*n_seq_diag=([0-9]+),n_prefix_diag=([0-9]+)\):[^0-9]*[0-9]+ runs - +([0-9.]+) us\/run.*/\1 \2 \3 \4 \5/p' <<< "$out")
+            if [ -z "$rows" ]; then
+                echo "no result from ${names[$k]} for $re:" >&2
+                tail -n 5 <<< "$out" >&2
+                exit 1
+            fi
+            awk -v b="${names[$k]}" -v r="$rep" '{print b, r, $0}' <<< "$rows" >> "$log"
         done
     done
 done
@@ -51,7 +56,7 @@ for key in sorted(us):
     for name in others:
         ch = [100 * (d[(name, r)] / d[(ref, r)] - 1) for r in reps if (name, r) in d and (ref, r) in d]
         boot = sorted(statistics.median(rng.choices(ch, k=len(ch))) for _ in range(4000))
-        cells.append(f"{name} {statistics.median(ch):+6.1f}% [{boot[100]:+.1f}, {boot[3899]:+.1f}] "
-                     f"{sum(c > 0 for c in ch)}/{len(ch)}")
+        low, high = boot[int(0.025 * len(boot))], boot[int(0.975 * len(boot)) - 1]
+        cells.append(f"{name} {statistics.median(ch):+6.1f}% [{low:+.1f}, {high:+.1f}] {sum(c > 0 for c in ch)}/{len(ch)}")
     print(f"kv={key[0]:<6} nq={key[1]:<5} seqs={key[2]:<2} prefix={key[3]:<3} {ref} {base:8.1f} us   " + "   ".join(cells))
 EOF

@@ -1,0 +1,18 @@
+== stock
+  N=8 at  10/s  N=8  requests: completed  9.79/s  p50      58 ms  p95     239 ms  errors 0
+  N=8 at  10/s  N=32 requests: completed  1.94/s  p50     258 ms  p95     701 ms  errors 0
+  N=8 at  20/s  N=8  requests: completed 19.18/s  p50     105 ms  p95     625 ms  errors 0
+  N=8 at  20/s  N=32 requests: completed  1.94/s  p50     368 ms  p95    3477 ms  errors 0
+  N=8 at  30/s  N=8  requests: completed 25.22/s  p50    1667 ms  p95    6143 ms  errors 0
+  N=8 at  30/s  N=32 requests: completed  1.66/s  p50    3154 ms  p95    7067 ms  errors 0
+  N=8 at  40/s  N=8  requests: completed 23.62/s  p50   13700 ms  p95   29996 ms  errors 0
+  N=8 at  40/s  N=32 requests: completed  1.09/s  p50   18747 ms  p95   30662 ms  errors 0
+== all
+  N=8 at  10/s  N=8  requests: completed  9.80/s  p50      41 ms  p95      91 ms  errors 0
+  N=8 at  10/s  N=32 requests: completed  1.95/s  p50     117 ms  p95     289 ms  errors 0
+  N=8 at  20/s  N=8  requests: completed 19.18/s  p50      55 ms  p95     137 ms  errors 0
+  N=8 at  20/s  N=32 requests: completed  1.95/s  p50     170 ms  p95     548 ms  errors 0
+  N=8 at  30/s  N=8  requests: completed 29.13/s  p50      81 ms  p95     279 ms  errors 0
+  N=8 at  30/s  N=32 requests: completed  1.92/s  p50     325 ms  p95    2208 ms  errors 0
+  N=8 at  40/s  N=8  requests: completed 37.66/s  p50    1838 ms  p95    3922 ms  errors 0
+  N=8 at  40/s  N=32 requests: completed  1.54/s  p50   20897 ms  p95   43385 ms  errors 0

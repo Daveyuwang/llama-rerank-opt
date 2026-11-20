@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Held-out A/B of several llama-server builds: SESSIONS sessions (default 2) of ROUNDS rounds (default 5), the builds
-# alternating within each session; then the sessions of each build are pooled and every build is compared with the
-# first one (paired bootstrap over queries, scripts/ab_compare.py).
-# usage: MODEL=model.gguf scripts/ab_holdout.sh OUT_DIR NAME=SERVER_BIN NAME=SERVER_BIN ...
-# SERVER_ARGS replaces the server configuration (default: the benchmark configuration of the results).
+# Held-out A/B of several servers: SESSIONS sessions (default 2) of ROUNDS rounds (default 5); the order of the
+# servers rotates from session to session. Then the sessions of each server are pooled and every server is compared
+# with the first one (paired bootstrap over queries, scripts/ab_compare.py).
+# usage: MODEL=model.gguf scripts/ab_holdout.sh OUT_DIR NAME=SERVER NAME=SERVER ...
+# SERVER is a llama-server binary or vllm:DIR, see bench_server.sh; SERVER_ARGS replaces the llama-server configuration.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
-out=${1:?usage: ab_holdout.sh OUT_DIR NAME=SERVER_BIN NAME=SERVER_BIN ...}
+out=${1:?usage: ab_holdout.sh OUT_DIR NAME=SERVER NAME=SERVER ...}
 shift
-[ $# -ge 2 ] || { echo "need at least two builds" >&2; exit 1; }
+[ $# -ge 2 ] || { echo "need at least two servers" >&2; exit 1; }
+specs=("$@")
 sessions=${SESSIONS:-2}
-rounds=${ROUNDS:-5}
-read -r -a server_args <<< "${SERVER_ARGS:--np 32 -kvu -b 8192 -ub 2048}"
 mkdir -p "$out"
 
 names=()
-for spec in "$@"; do names+=("${spec%%=*}"); done
-for ((s = 1; s <= sessions; s++)); do
-    for spec in "$@"; do
+for spec in "${specs[@]}"; do names+=("${spec%%=*}"); done
+for ((s = 0; s < sessions; s++)); do
+    for ((i = 0; i < ${#specs[@]}; i++)); do
+        spec=${specs[$(((i + s) % ${#specs[@]}))]}
         name=${spec%%=*}
-        echo "== session $s: $name"
-        bash "$repo/scripts/bench_server.sh" "${spec#*=}" "$out/$name-s$s.jsonl" "$rounds" holdout -- "${server_args[@]}"
+        echo "== session $((s + 1)): $name"
+        bash "$repo/scripts/bench_server.sh" "${spec#*=}" "$out/$name-s$((s + 1)).jsonl" "${ROUNDS:-5}" holdout
     done
 done
 for name in "${names[@]}"; do

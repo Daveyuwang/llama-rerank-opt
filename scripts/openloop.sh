@@ -11,16 +11,16 @@ out=${1:?usage: openloop.sh OUT_DIR NAME=SERVER_BIN ...}
 shift
 cases=${CASES:-$repo/data/cases.jsonl}
 read -r -a rates <<< "${RATES:-2 4 6 8 10 12}"
-read -r -a server_args <<< "${SERVER_ARGS:--np 32 -kvu -b 8192 -ub 2048}"
 mkdir -p "$out"
 trap stop_server EXIT
 
 load() { python3 -I "$repo/scripts/openloop.py" --cases "$cases" --partition holdout --n 32 --port "$PORT" "$@"; }
 for spec in "$@"; do
     name=${spec%%=*}
-    start_server "${spec#*=}" "$out/openloop-$name.server.log" "${server_args[@]}"
+    start_server "${spec#*=}" "$out/openloop-$name.server.log" "${bench_args[@]}"
     rm -f "$out/openloop-$name.warmup.jsonl"
     load --rates 3 --seconds 10 --out "$out/openloop-$name.warmup.jsonl" > /dev/null
+    rm -f "$out/openloop-$name.warmup.jsonl"
     echo "== $name"
     load --rates "${rates[@]}" --seconds "${DURATION:-40}" --out "$out/openloop-$name.jsonl"
     stop_server

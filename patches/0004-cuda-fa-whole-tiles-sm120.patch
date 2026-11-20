@@ -1,14 +1,13 @@
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index fc0cc74..d7b69d2 100644
+index fc0cc74..3a39f8e 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
-@@ -1206,7 +1206,10 @@ void launch_fattn(
+@@ -1206,7 +1206,9 @@ void launch_fattn(
      dim3 blocks_num;
      if (stream_k) {
          // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
 -        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_GB10 && async_kv_preload && scan_mask;
-+        // On sm_120 whole tiles only pay off while the K/V length is at most twice the number of queries, e.g. the first
-+        // ubatches of a prompt or several sequences in one ubatch; with longer K/V the tiles cost about the same.
++        // On sm_120 whole tiles pay off while the K/V length is at most twice the number of queries, e.g. the first ubatches of a prompt or several sequences in one ubatch.
 +        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && async_kv_preload && scan_mask &&
 +            (cc == GGML_CUDA_CC_GB10 || (cc == GGML_CUDA_CC_BLACKWELL && n_kv_cols <= 2*Q->ne[1]));
  
