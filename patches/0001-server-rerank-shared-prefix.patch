@@ -1,0 +1,91 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f821ac6..df355e3 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4070,7 +4070,8 @@ private:
+                                 return;
+                             }
+ 
+-                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
++                            // a child continues from the shared prefix that its parent copied to it, also when stateless
++                            if ((slot.task->params.cache_prompt && !slot.task->is_stateless()) || slot.task->is_child()) {
+                                 // reuse any previously computed tokens that are common with the new prompt
+                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+ 
+@@ -5206,6 +5207,7 @@ server_context_meta server_context::get_meta() const {
+         /* json_ui_settings        */ impl->json_ui_settings,
+         /* slot_n_ctx              */ impl->n_ctx_slot(),
+         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
++        /* can_share_prefix        */ llama_get_causal_attn(impl->ctx_tgt) && llama_get_memory(impl->ctx_tgt) != nullptr,
+ 
+         /* chat_params             */ impl->chat_params,
+         /* chat_template_caps      */ common_chat_templates_get_caps(impl->chat_params.tmpls.get()),
+@@ -6971,13 +6973,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
+     {
+         std::vector<server_task> tasks;
+         tasks.reserve(documents.size());
++        bool has_mtmd = false;
+         for (size_t i = 0; i < documents.size(); i++) {
+             auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query_str, documents[i], query_files, document_files[i], ctx_server.init_opt);
++            has_mtmd = has_mtmd || tmp.has_mtmd;
+             server_task task = server_task(SERVER_TASK_TYPE_RERANK);
+             task.id     = rd.get_new_id();
+             task.tokens = std::move(tmp);
+             tasks.push_back(std::move(task));
+         }
++        // a causal reranker evaluates the common query prefix once, then each document continues from it
++        // the prefix is an extra decode step, so share it only if this skips at least one ubatch of tokens
++        if (meta->can_share_prefix && !has_mtmd) {
++            tasks = server_decision_group_tasks(std::move(tasks), params.n_parallel, params.n_ubatch);
++        }
+         rd.post_tasks(std::move(tasks));
+     }
+ 
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 2c91d53..2fd636b 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -32,6 +32,7 @@ struct server_context_meta {
+     json json_ui_settings;
+     int slot_n_ctx;
+     enum llama_pooling_type pooling_type;
++    bool can_share_prefix; // causal attention with a memory module: a sequence can continue from a copied prompt prefix
+ 
+     // chat params
+     server_chat_params & chat_params;
+diff --git a/tools/server/server-decision.cpp b/tools/server/server-decision.cpp
+index c4414aa..cafa75e 100644
+--- a/tools/server/server-decision.cpp
++++ b/tools/server/server-decision.cpp
+@@ -1816,7 +1816,7 @@ json server_decision_context::format_answer(const server_decision_question & que
+ // shared prompt prefix
+ //
+ 
+-std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots) {
++std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots, size_t n_min_saved) {
+     n_slots = std::max(n_slots, (size_t) 1);
+ 
+     std::vector<server_task> groups;
+@@ -1831,7 +1831,7 @@ std::vector<server_task> server_decision_group_tasks(std::vector<server_task> &&
+             n_shared = std::min({n_shared, tasks[j].tokens.size() - 1, (size_t) parent.decision.pos_first(), (size_t) tasks[j].decision.pos_first()});
+         }
+ 
+-        if (end - i < 2 || n_shared == 0) {
++        if (end - i < 2 || n_shared == 0 || (end - i - 1) * n_shared < n_min_saved) {
+             for (size_t j = i; j < end; j++) {
+                 groups.push_back(std::move(tasks[j]));
+             }
+diff --git a/tools/server/server-decision.h b/tools/server/server-decision.h
+index 8d5f709..a529397 100644
+--- a/tools/server/server-decision.h
++++ b/tools/server/server-decision.h
+@@ -204,7 +204,8 @@ private:
+ // group the tasks so that the common prefix of their prompts is evaluated only once
+ // each group is one parent and its children, it takes at most n_slots slots
+ // note: the order of the tasks is preserved
+-std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots);
++// a group that skips fewer than n_min_saved tokens is not shared
++std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots, size_t n_min_saved = 0);
+ 
+ // write "<|name|>" with U+00A6 in place of "|", so text from the request is not parsed as special tokens
+ std::string server_decision_escape_special_tokens(const std::string & text);

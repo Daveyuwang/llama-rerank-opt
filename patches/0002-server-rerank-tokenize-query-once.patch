@@ -1,0 +1,102 @@
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index eb5781e..e8e5c85 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -2193,6 +2193,58 @@ server_tokens format_prompt_rerank(
+     return result;
+ }
+ 
++std::vector<server_tokens> format_prompts_rerank_shared(
++        const struct llama_model * model,
++        const struct llama_vocab * vocab,
++        const std::string & query,
++        const std::vector<std::string> & docs) {
++    // the regex pre-tokenizer of BPE vocabs does not merge across a line break that is followed by text
++    const char * rerank_prompt = llama_model_chat_template(model, "rerank");
++    if (rerank_prompt == nullptr || docs.size() < 2 || llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_BPE) {
++        return {};
++    }
++
++    // split the template at the start of the line with {document}, the query has to be before it
++    const std::string tmpl = rerank_prompt;
++    const size_t pos_query = tmpl.find("{query}");
++    const size_t pos_doc   = tmpl.find("{document}");
++    if (pos_query == std::string::npos || pos_doc == std::string::npos || pos_query > pos_doc) {
++        return {};
++    }
++    const size_t split = tmpl.rfind('\n', pos_doc);
++    if (split == std::string::npos || split < pos_query + 7 || tmpl.find("{query}", split) != std::string::npos) {
++        return {};
++    }
++    // the line with {document} has to start with template text, the same for every document: the line break before
++    // it could merge with whitespace at the start of a document, then checking the first document would not suffice
++    const char c_line = tmpl[split + 1];
++    if (pos_doc == split + 1 || c_line == ' ' || c_line == '\t' || c_line == '\r' || c_line == '\n') {
++        return {};
++    }
++    const std::string tmpl_head = tmpl.substr(0, split + 1);
++    const std::string tmpl_tail = tmpl.substr(split + 1);
++
++    const llama_tokens head = common_tokenize(vocab, format_rerank_template(tmpl_head, query, ""), false, true);
++    auto tokenize = [&](const std::string & doc) {
++        llama_tokens tokens = head;
++        const llama_tokens tail = common_tokenize(vocab, format_rerank_template(tmpl_tail, query, doc), false, true);
++        tokens.insert(tokens.end(), tail.begin(), tail.end());
++        return tokens;
++    };
++
++    // the split must give the tokens of the whole prompt, checked with the first document
++    if (tokenize(docs[0]) != common_tokenize(vocab, format_rerank_template(tmpl, query, docs[0]), false, true)) {
++        return {};
++    }
++
++    std::vector<server_tokens> result;
++    result.reserve(docs.size());
++    for (const auto & doc : docs) {
++        result.emplace_back(tokenize(doc), false);
++    }
++    return result;
++}
++
+ //
+ // server_subproc
+ //
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 911bb31..6f04549 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -645,6 +645,14 @@ server_tokens format_prompt_rerank(
+         const std::vector<raw_buffer> & doc_files,
+         const mtmd_helper_init_opt & init_opt);
+ 
++// rerank tasks of one query and several text documents, with the query part of the prompt tokenized only once
++// returns an empty vector if this does not give the tokens of format_prompt_rerank, then format each document with it
++std::vector<server_tokens> format_prompts_rerank_shared(
++        const struct llama_model * model,
++        const struct llama_vocab * vocab,
++        const std::string & query,
++        const std::vector<std::string> & docs);
++
+ // simple implementation of a pipe
+ // used for streaming data between threads
+ template<typename T>
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index df355e3..1b3dab6 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6974,8 +6974,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
+         std::vector<server_task> tasks;
+         tasks.reserve(documents.size());
+         bool has_mtmd = false;
++        // text only: the query part of the prompts is tokenized once
++        const bool has_files = !query_files.empty() ||
++            std::any_of(document_files.begin(), document_files.end(), [](const auto & files) { return !files.empty(); });
++        std::vector<server_tokens> shared = has_files ? std::vector<server_tokens>() :
++            format_prompts_rerank_shared(ctx_server.model_tgt, ctx_server.vocab, query_str, documents);
+         for (size_t i = 0; i < documents.size(); i++) {
+-            auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query_str, documents[i], query_files, document_files[i], ctx_server.init_opt);
++            auto tmp = !shared.empty() ? std::move(shared[i]) :
++                format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query_str, documents[i], query_files, document_files[i], ctx_server.init_opt);
+             has_mtmd = has_mtmd || tmp.has_mtmd;
+             server_task task = server_task(SERVER_TASK_TYPE_RERANK);
+             task.id     = rd.get_new_id();

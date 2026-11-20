@@ -1,0 +1,5 @@
+# workload built by scripts/rerank_bench.py prepare, model files, local runs and llama.cpp checkouts
+/data/
+/models/
+/runs/
+/llama.cpp*/

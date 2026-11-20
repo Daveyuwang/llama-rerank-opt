@@ -1,0 +1,289 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 1b3dab6..9b24d96 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1063,6 +1063,11 @@ public:
+     server_queue    queue_tasks;
+     server_response queue_results;
+ 
++    // a rerank sharing group that waits until it has free slots for all its tasks: no other task starts meanwhile,
++    // otherwise smaller requests can keep taking the slots that become free and starve it
++    int    id_group_waiting      = -1;
++    size_t n_slots_group_waiting = 0;
++
+     // note: chat_params must not be refreshed upon existing sleeping state
+     server_chat_params chat_params;
+ 
+@@ -1566,6 +1571,11 @@ private:
+             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+ 
+             slot.callback_on_release = [this](int id_slot) {
++                // a waiting sharing group with enough free slots now is retried, but after a task deferred for this
++                // slot (e.g. a slot save): both go to the front of the main queue, the one popped last runs first
++                if (id_group_waiting != -1 && get_free_slots(n_slots_group_waiting, -1).size() >= n_slots_group_waiting) {
++                    queue_tasks.pop_deferred_task_id(id_group_waiting);
++                }
+                 queue_tasks.pop_deferred_task(id_slot);
+             };
+ 
+@@ -2949,6 +2959,33 @@ private:
+         return n_read;
+     }
+ 
++    // a rerank sharing group: it needs free slots for all its tasks at the same time
++    static bool is_rerank_group(const server_task & task) {
++        return task.is_parent() && task.type == SERVER_TASK_TYPE_RERANK && task.n_tokens_shared > 0;
++    }
++
++    // the busy slots only run rerank or embedding tasks, which finish soon
++    bool only_short_tasks_running() const {
++        for (const auto & slot : slots) {
++            if (slot.is_processing() && slot.task &&
++                    slot.task->type != SERVER_TASK_TYPE_RERANK && slot.task->type != SERVER_TASK_TYPE_EMBEDDING) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    // the waiting sharing group started, was dropped or was cancelled: the oldest deferred group waits next, so that
++    // the groups start in the order they arrived, and the tasks deferred behind it can take the free slots
++    void end_group_wait() {
++        id_group_waiting = queue_tasks.promote_deferred(is_rerank_group, n_slots_group_waiting);
++        for (auto & other : slots) {
++            if (!other.is_processing()) {
++                queue_tasks.pop_deferred_task(other.id);
++            }
++        }
++    }
++
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only reading the server state is safe
+@@ -2982,6 +3019,31 @@ private:
+ 
+                     const int id_task = task.id;
+ 
++                    const bool   is_group      = is_rerank_group(task);
++                    const size_t n_slots_group = is_group ? task.child_tasks.size() + 1 : 0;
++
++                    // while a group waits, the other tasks are deferred behind it; not while a slot runs a task that
++                    // may take long (e.g. a completion), the group could then not start soon
++                    if (id_group_waiting != -1 && id_task != id_group_waiting && only_short_tasks_running()) {
++                        SRV_DBG("sharing group %d waits for free slots, defer task, id_task = %d\n", id_group_waiting, id_task);
++                        queue_tasks.defer(std::move(task));
++                        // no running task may be left to release a slot and retry the group
++                        // (if the group was cancelled, it is no longer deferred and its cancel task ends the wait)
++                        if (get_free_slots(n_slots_group_waiting, -1).size() >= n_slots_group_waiting) {
++                            queue_tasks.pop_deferred_task_id(id_group_waiting);
++                        }
++                        break;
++                    }
++                    // the waiting group is retried first, at every released slot; a later group waits behind it
++                    auto defer_task = [&]() {
++                        const bool waits = is_group && (id_group_waiting == -1 || id_group_waiting == id_task);
++                        if (waits) {
++                            id_group_waiting      = id_task;
++                            n_slots_group_waiting = n_slots_group;
++                        }
++                        queue_tasks.defer(std::move(task), waits);
++                    };
++
+                     const auto plan = slot_sched.select(get_slot_infos(), task, get_task_lora(task));
+ 
+                     server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
+@@ -2993,14 +3055,14 @@ private:
+                     if (slot == nullptr) {
+                         // if no slot is available, we defer this task for processing later
+                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+-                        queue_tasks.defer(std::move(task));
++                        defer_task();
+                         break;
+                     }
+ 
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+-                        queue_tasks.defer(std::move(task));
++                        defer_task();
+                         break;
+                     }
+ 
+@@ -3011,7 +3073,7 @@ private:
+                         child_slots = get_free_slots(n_child_tasks, slot->id);
+                         if (child_slots.size() < n_child_tasks) {
+                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+-                            queue_tasks.defer(std::move(task));
++                            defer_task();
+                             break;
+                         }
+                     }
+@@ -3021,13 +3083,22 @@ private:
+                         update_prompt_cache(*slot, task);
+                     }
+ 
++                    bool launched;
+                     if (task.is_parent()) {
+-                        if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
++                        launched = launch_slots_with_parent_task(*slot, child_slots, std::move(task));
++                        if (!launched) {
+                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
+-                            break; // drop the task
+                         }
+-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
+-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
++                    } else {
++                        launched = launch_slot_with_task(*slot, std::move(task));
++                        if (!launched) {
++                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
++                        }
++                    }
++                    if (id_task == id_group_waiting) {
++                        end_group_wait();
++                    }
++                    if (!launched) {
+                         break; // drop the task
+                     }
+ 
+@@ -3051,6 +3122,12 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_CANCEL:
+                 {
++                    // the queue removed the cancelled task when the cancel was posted, unless the task was being
++                    // processed then and was deferred afterwards: remove it now, it must not run or keep a group waiting
++                    queue_tasks.remove_deferred(task.id_target);
++                    if (task.id_target == id_group_waiting) {
++                        end_group_wait();
++                    }
+                     // release slot linked with the task id
+                     for (auto & slot : slots) {
+                         if (slot.task && slot.task->id == task.id_target) {
+@@ -3185,6 +3262,7 @@ private:
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
++                        task.id_slot = id_slot; // the release of this slot pops it first
+                         queue_tasks.defer(std::move(task));
+                         break;
+                     }
+@@ -3247,6 +3325,7 @@ private:
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
++                        task.id_slot = id_slot; // the release of this slot pops it first
+                         queue_tasks.defer(std::move(task));
+                         break;
+                     }
+@@ -3316,6 +3395,7 @@ private:
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
++                        task.id_slot = id_slot; // the release of this slot pops it first
+                         queue_tasks.defer(std::move(task));
+                         break;
+                     }
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index 75daebb..1119e66 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -73,10 +73,14 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
+     return 0;
+ }
+ 
+-void server_queue::defer(server_task && task) {
++void server_queue::defer(server_task && task, bool front) {
+     std::unique_lock<std::mutex> lock(mutex_tasks);
+     QUE_DBG("defer task, id = %d\n", task.id);
+-    queue_tasks_deferred.push_back(std::move(task));
++    if (front) {
++        queue_tasks_deferred.push_front(std::move(task));
++    } else {
++        queue_tasks_deferred.push_back(std::move(task));
++    }
+     time_last_task = ggml_time_ms();
+     condition_tasks.notify_one();
+ }
+@@ -112,6 +116,44 @@ void server_queue::pop_deferred_task(int id_slot) {
+     condition_tasks.notify_one();
+ }
+ 
++void server_queue::pop_deferred_task_id(int id_task) {
++    std::unique_lock<std::mutex> lock(mutex_tasks);
++    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
++        if (it->id == id_task) {
++            QUE_DBG("pop deferred task, id_task = %d\n", id_task);
++            queue_tasks.emplace_front(std::move(*it));
++            queue_tasks_deferred.erase(it);
++            break;
++        }
++    }
++    time_last_task = ggml_time_ms();
++    condition_tasks.notify_one();
++}
++
++void server_queue::remove_deferred(int id_task) {
++    std::unique_lock<std::mutex> lock(mutex_tasks);
++    queue_tasks_deferred.erase(
++        std::remove_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(),
++            [id_task](const server_task & task) { return task.id == id_task; }),
++        queue_tasks_deferred.end());
++}
++
++int server_queue::promote_deferred(const std::function<bool(const server_task &)> & pred, size_t & n_tasks) {
++    std::unique_lock<std::mutex> lock(mutex_tasks);
++    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
++        if (pred(*it)) {
++            const int id_task = it->id;
++            n_tasks = it->child_tasks.size() + 1;
++            server_task task = std::move(*it);
++            queue_tasks_deferred.erase(it);
++            queue_tasks_deferred.push_front(std::move(task));
++            return id_task;
++        }
++    }
++    n_tasks = 0;
++    return -1;
++}
++
+ void server_queue::wait_until_no_sleep() {
+     std::unique_lock<std::mutex> lock(mutex_tasks);
+     if (sleeping) {
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+index f9d66be..f0d3557 100644
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -5,6 +5,7 @@
+ #include <condition_variable>
+ #include <deque>
+ #include <exception>
++#include <functional>
+ #include <mutex>
+ #include <thread>
+ #include <vector>
+@@ -57,7 +58,8 @@ public:
+     int post(std::vector<server_task> && tasks, bool front = false);
+ 
+     // Add a new task, but defer until one slot is available
+-    void defer(server_task && task);
++    // with front, the task is the next one popped from the deferred tasks
++    void defer(server_task && task, bool front = false);
+ 
+     // Get the next id for creating a new task
+     int get_new_id();
+@@ -66,6 +68,16 @@ public:
+     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
+     void pop_deferred_task(int id_slot);
+ 
++    // move the deferred task with this id to the front of the main queue, if it is still deferred
++    void pop_deferred_task_id(int id_task);
++
++    // remove the deferred task with this id, e.g. one that was cancelled while it was being processed
++    void remove_deferred(int id_task);
++
++    // move the first deferred task for which pred is true to the front of the deferred tasks
++    // returns its id and sets n_tasks to the number of tasks in it (itself and its children), or -1 if there is none
++    int promote_deferred(const std::function<bool(const server_task &)> & pred, size_t & n_tasks);
++
+     // if sleeping, request exiting sleep state and wait until it is done
+     // returns immediately if not sleeping
+     // the server then stays awake until the caller calls release_inflight()

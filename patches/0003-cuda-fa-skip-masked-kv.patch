@@ -1,0 +1,501 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index fc0cc74..26edab1 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -717,7 +717,33 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+     }
+ }
+ 
++// Whether the FATTN_KQ_STRIDE mask columns starting at column sj are -inf for all ncols1 rows.
++// All threads of the block must call it with the same sj.
+ template <int ncols1>
++static __device__ __forceinline__ int flash_attn_mask_cols_all_inf(const half2 * mask, const int64_t s31, const int sj, int * buf_iw) {
++    const int tid = threadIdx.x;
++    int all_inf = 1;
++
++#pragma unroll
++    for (int j = 0; j < ncols1; ++j) {
++        const float2 tmp = __half22float2(mask[j*s31 + sj/2 + tid]);
++        all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
++    }
++
++    all_inf = warp_reduce_all(all_inf);
++    if (tid % WARP_SIZE == 0) {
++        buf_iw[tid / WARP_SIZE] = all_inf;
++    }
++    __syncthreads();
++    all_inf = buf_iw[tid % WARP_SIZE];
++    __syncthreads();
++    return warp_reduce_all(all_inf);
++}
++
++// Output layout for ntiles = gridDim.x*gridDim.y query tiles: ntiles KV_max values, then ntiles origins and ntiles lengths of
++// the block order for tiles with fully masked K/V blocks to skip (length 0 if none). Without find_masked they are 0.
++// With find_masked the dynamic shared memory holds one bit per FATTN_KQ_STRIDE columns: whether they have non-masked values.
++template <int ncols1, bool find_masked>
+ __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+ static __global__ void flash_attn_mask_to_KV_max(
+         const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+@@ -725,6 +751,7 @@ static __global__ void flash_attn_mask_to_KV_max(
+     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
+ 
+     const int ne31     = gridDim.x;
++    const int ntiles   = gridDim.x*gridDim.y;
+     const int tid      = threadIdx.x;
+     const int sequence = blockIdx.y;
+     const int jt       = blockIdx.x;
+@@ -740,24 +767,7 @@ static __global__ void flash_attn_mask_to_KV_max(
+ 
+     int KV_max_sj = (ne30 - 1) * FATTN_KQ_STRIDE;
+     for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
+-        int all_inf = 1;
+-
+-#pragma unroll
+-        for (int j = 0; j < ncols1; ++j) {
+-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+-        }
+-
+-        all_inf = warp_reduce_all(all_inf);
+-        if (tid % WARP_SIZE == 0) {
+-            buf_iw[tid / WARP_SIZE] = all_inf;
+-        }
+-        __syncthreads();
+-        all_inf = buf_iw[tid % WARP_SIZE];
+-        __syncthreads();
+-        all_inf = warp_reduce_all(all_inf);
+-
+-        if (!all_inf) {
++        if (!flash_attn_mask_cols_all_inf<ncols1>(mask, s31, KV_max_sj, buf_iw)) {
+             break;
+         }
+     }
+@@ -767,11 +777,139 @@ static __global__ void flash_attn_mask_to_KV_max(
+     // In either case, walk back the decrementation by FATTN_KQ_STRIDE.
+     KV_max_sj += FATTN_KQ_STRIDE;
+ 
++    if constexpr (!find_masked) {
++        if (tid == 0) {
++            KV_max[           sequence*ne31 + jt] = KV_max_sj;
++            KV_max[  ntiles + sequence*ne31 + jt] = 0;
++            KV_max[2*ntiles + sequence*ne31 + jt] = 0;
++        }
++        return;
++    }
++
++    // The lower edge of the first tile with non-masked values, e.g. the start of a sequence in a multi-sequence ubatch.
++    int KV_min_sj = 0;
++    for (; KV_min_sj < KV_max_sj; KV_min_sj += FATTN_KQ_STRIDE) {
++        if (!flash_attn_mask_cols_all_inf<ncols1>(mask, s31, KV_min_sj, buf_iw)) {
++            break;
++        }
++    }
++
++    // The interior blocks of FATTN_KQ_STRIDE columns between KV_min and KV_max can be fully masked too, e.g. the other
++    // sequences of a multi-sequence ubatch. The checks go from cheap to complete: one value per block (the first in the
++    // first row of the tile) already finds the visible blocks of a causal sequence. Each warp then probes the first row
++    // of the remaining blocks, several blocks at a time so that the loads overlap. Only the blocks that look masked in the
++    // first row are checked in full, as for KV_max.
++    constexpr int nwarps   = FATTN_KQ_STRIDE/2 / WARP_SIZE;
++    constexpr int n_unroll = 4;
++    constexpr int n_h2     = FATTN_KQ_STRIDE/2 / WARP_SIZE; // half2 values per lane in one row of a block
++
++    const int warp    = tid / WARP_SIZE;
++    const int lane    = tid % WARP_SIZE;
++    const int n_words = (ne30 + 31) / 32;
++    const int c_lo    = KV_min_sj/FATTN_KQ_STRIDE + 1; // interior blocks [c_lo, c_hi)
++    const int c_hi    = KV_max_sj/FATTN_KQ_STRIDE - 1;
++
++    extern __shared__ uint32_t vis[];
++    for (int w = tid; w < n_words; w += blockDim.x) {
++        vis[w] = 0;
++    }
++    __syncthreads();
++
++    for (int c = c_lo + tid; c < c_hi; c += blockDim.x) {
++        const float2 tmp = __half22float2(mask[c*(FATTN_KQ_STRIDE/2)]);
++        if (!isinf(tmp.x) || !isinf(tmp.y)) {
++            atomicOr(vis + c/32, 1u << (c % 32));
++        }
++    }
++    __syncthreads();
++
++    for (int c0 = c_lo + warp*n_unroll; c0 < c_hi; c0 += nwarps*n_unroll) {
++        bool todo[n_unroll];
++        bool any[n_unroll];
++#pragma unroll
++        for (int u = 0; u < n_unroll; ++u) {
++            const int c = c0 + u;
++            todo[u] = c < c_hi && !((vis[c/32] >> (c % 32)) & 1u);
++            any[u]  = false;
++            if (todo[u]) {
++#pragma unroll
++                for (int k = 0; k < n_h2; ++k) {
++                    const float2 tmp = __half22float2(mask[c*(FATTN_KQ_STRIDE/2) + k*WARP_SIZE + lane]);
++                    any[u] = any[u] || !isinf(tmp.x) || !isinf(tmp.y);
++                }
++            }
++        }
++#pragma unroll
++        for (int u = 0; u < n_unroll; ++u) {
++            const int c = c0 + u;
++            if (todo[u] && warp_reduce_any(any[u]) && lane == 0) {
++                atomicOr(vis + c/32, 1u << (c % 32));
++            }
++        }
++    }
++    __syncthreads();
++
++    // Every thread reads the same bits, so the full checks below are entered uniformly.
++    for (int w = c_lo/32; w*32 < c_hi; ++w) {
++        const int      lo    = max(c_lo - w*32, 0);
++        const int      hi    = min(c_hi - w*32, 32);
++        const uint32_t range = hi <= lo ? 0u : (hi == 32 ? 0xFFFFFFFFu : (1u << hi) - 1u) & ~((1u << lo) - 1u);
++        uint32_t       todo  = ~vis[w] & range;
++        while (todo) {
++            const int c = w*32 + __ffs(todo) - 1;
++            todo &= todo - 1;
++            if (!flash_attn_mask_cols_all_inf<ncols1>(mask, s31, c*FATTN_KQ_STRIDE, buf_iw) && tid == 0) {
++                atomicOr(vis + w, 1u << (c % 32));
++            }
++        }
++    }
++
+     if (threadIdx.x != 0) {
+         return;
+     }
+ 
+-    KV_max[sequence*ne31 + jt] = KV_max_sj;
++    // The FA kernels skip the longest run of fully masked interior blocks, e.g. the documents between a shared prefix
++    // and the sequence of this tile. One run keeps the K/V loop of the kernels as simple as without holes.
++    int hole_lo = 0;
++    int hole_hi = 0;
++    int run_lo  = -1;
++    for (int c = c_lo; c < c_hi; ++c) {
++        const uint32_t word = vis[c/32];
++        if (run_lo < 0 && c % 32 == 0 && c + 32 <= c_hi && word == 0xFFFFFFFFu) {
++            c += 31; // a word of visible blocks
++            continue;
++        }
++        const bool visible = word & (1u << (c % 32));
++        if (!visible && run_lo < 0) {
++            run_lo = c;
++        } else if (visible && run_lo >= 0) {
++            if (c - run_lo > hole_hi - hole_lo) {
++                hole_lo = run_lo;
++                hole_hi = c;
++            }
++            run_lo = -1;
++        }
++    }
++    if (run_lo >= 0 && c_hi - run_lo > hole_hi - hole_lo) {
++        hole_lo = run_lo;
++        hole_hi = c_hi;
++    }
++
++    // A tile with blocks to skip starts its block order after the fully masked range, or at KV_min if that skips more.
++    // Then its unmasked blocks are within the first pend columns of that order, see flash_attn_ext_f16.
++    int origin = 0;
++    int pend   = 0;
++    if (hole_lo < hole_hi && KV_min_sj <= (hole_hi - hole_lo)*FATTN_KQ_STRIDE) {
++        origin = hole_hi*FATTN_KQ_STRIDE;
++        pend   = (ne30 - hole_hi + hole_lo)*FATTN_KQ_STRIDE;
++    } else if (KV_min_sj > 0) {
++        origin = KV_min_sj;
++        pend   = KV_max_sj - KV_min_sj;
++    }
++
++    KV_max[           sequence*ne31 + jt] = KV_max_sj;
++    KV_max[  ntiles + sequence*ne31 + jt] = origin;
++    KV_max[2*ntiles + sequence*ne31 + jt] = pend;
+ }
+ 
+ void ggml_cuda_flash_attn_ext_compact_mask(
+@@ -1181,10 +1319,24 @@ void launch_fattn(
+         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
+         const int iter_k = n_kv_cols / FATTN_KQ_STRIDE;
+ 
+-        KV_max.alloc(ne_KV_max);
+-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+-        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
+-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
++        // Only the MMA kernel with multi-stage K/V loading skips fully masked K/V blocks within a tile, in place of its
++        // block rotation. They come from several sequences in one K/V slice, worth scanning for with prefill-sized
++        // batches; separate slices hold one sequence each.
++        // The scan for them keeps one bit per K/V block in shared memory, enough for 64M columns.
++        const size_t nbytes_vis  = (iter_k + 31)/32 * sizeof(uint32_t);
++        const bool   find_masked = async_kv_preload && Q->ne[3] == 1 && Q->ne[1] >= 256 && nbytes_vis <= 32*1024;
++
++        // KV_max, block order origins and lengths, see flash_attn_mask_to_KV_max
++        KV_max.alloc(3*ne_KV_max);
++        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max,
++            find_masked ? nbytes_vis : 0, main_stream);
++        if (find_masked) {
++            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, true>, launch_params,
++                (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
++        } else {
++            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, false>, launch_params,
++                (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
++        }
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index dea8d2a..985db9b 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -2039,6 +2039,10 @@ static __global__ void flash_attn_ext_f16(
+         KV_max = KV_max_ptr + int64_t(iter_j)*ne33*ne11;
+     }
+ 
++    // block order of the query tiles with fully masked K/V blocks to skip, stored after the KV_max values,
++    // see flash_attn_mask_to_KV_max
++    const int * GGML_CUDA_RESTRICT KV_order = !use_sparse && KV_max ? KV_max + iter_j*ne03 : nullptr;
++
+     // kbc == k block continuous, current index in continuous ijk space.
+     int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
+     const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
+@@ -2092,18 +2096,23 @@ static __global__ void flash_attn_ext_f16(
+             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+         }
+         const int kb0_max = rotate && KV_max ? KV_max[sequence*iter_j + jt] / nbatch_fa : iter_k;
+-        const int kb0_rot = rotate ? (kbc - kbc_tile) % iter_k : kb0_start;
++        // A tile with fully masked K/V blocks to skip is not rotated: its block order starts at kb0_origin, then its unmasked
++        // blocks are at the positions [0, kb0_pend) and the positions after them are cut off, see flash_attn_mask_to_KV_max.
++        const int kb0_pend   = rotate && KV_order ? KV_order[iter_j*ne03 + sequence*iter_j + jt] / nbatch_fa : 0;
++        const int kb0_origin = kb0_pend > 0 ? KV_order[sequence*iter_j + jt] / nbatch_fa : 0;
++        const int kb0_rot    = !rotate ? kb0_start : (kb0_pend > 0 ? (kb0_start + kb0_origin) % iter_k : (kbc - kbc_tile) % iter_k);
++        const int kb0_end    = kb0_pend > 0 ? max(min(kb0_stop, kb0_pend), kb0_start + 1) : kb0_stop;
+         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+         if (kb0_start == 0) {
+             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
++                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_end - kb0_start, kb0_max);
+         } else {
+             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
+             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
++                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_end - kb0_start, kb0_max);
+         }
+ 
+         kbc += iter_k;
+@@ -2144,14 +2153,17 @@ static __global__ void flash_attn_ext_f16(
+     } else if (KV_max && !rotate) {
+         kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+     }
+-    const int kb0_max = rotate && KV_max ? KV_max[sequence*iter_j + jt] / nbatch_fa : iter_k;
+-    const int kb0_rot = rotate ? (kbc - kbc_tile) % iter_k : kb0_start;
++    const int kb0_max    = rotate && KV_max ? KV_max[sequence*iter_j + jt] / nbatch_fa : iter_k;
++    const int kb0_pend   = rotate && KV_order ? KV_order[iter_j*ne03 + sequence*iter_j + jt] / nbatch_fa : 0;
++    const int kb0_origin = kb0_pend > 0 ? KV_order[sequence*iter_j + jt] / nbatch_fa : 0;
++    const int kb0_rot    = !rotate ? kb0_start : (kb0_pend > 0 ? (kb0_start + kb0_origin) % iter_k : (kbc - kbc_tile) % iter_k);
++    const int kb0_end    = kb0_pend > 0 ? max(min(kb0_stop, kb0_pend), kb0_start + 1) : kb0_stop;
+ 
+     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
+     constexpr bool needs_fixup = false;
+     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+         (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_stop - kb0_start, kb0_max);
++         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_rot, kb0_rot + kb0_end - kb0_start, kb0_max);
+ #else
+     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 6d99453..b9de9b5 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -217,6 +217,47 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
+     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+ }
+ 
++// causal mask of n_seq sequences of unequal length that share one K/V slice, like a multi-sequence ubatch:
++// a query sees the earlier tokens of its own sequence and the first n_prefix positions (a prefix shared by all sequences),
++// the queries are the last ne1 K/V positions
++// n_lead K/V positions at the start that no query sees (e.g. an earlier request), then n_prefix positions that every
++// query sees, then the n_seq sequences; the queries are the last tensor->ne[1] positions
++static void init_tensor_kq_mask_seq_diag(ggml_tensor * tensor, int64_t n_seq, int64_t n_prefix, int64_t n_lead = 0) {
++    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
++
++    const int64_t n_kv = tensor->ne[0];
++    const int64_t n_q  = tensor->ne[1];
++    GGML_ASSERT(n_seq > 0 && n_kv - n_q >= n_lead && n_kv >= n_lead + n_prefix + 3*n_seq);
++
++    // sequence s gets a share of the K/V positions after the prefix proportional to s % 3 + 1
++    std::vector<int64_t> start(n_seq + 1, n_lead + n_prefix);
++    int64_t n_weight = 0;
++    for (int64_t s = 0; s < n_seq; ++s) {
++        n_weight += s % 3 + 1;
++    }
++    int64_t acc = 0;
++    for (int64_t s = 0; s < n_seq; ++s) {
++        acc += s % 3 + 1;
++        start[s + 1] = n_lead + n_prefix + (n_kv - n_lead - n_prefix)*acc/n_weight;
++    }
++
++    std::vector<ggml_fp16_t> data(ggml_nelements(tensor));
++    for (int64_t i23 = 0; i23 < tensor->ne[2]*tensor->ne[3]; ++i23) {
++        for (int64_t iq = 0; iq < n_q; ++iq) {
++            const int64_t pos = n_kv - n_q + iq;
++            int64_t s = 0;
++            while (start[s + 1] <= pos) {
++                ++s;
++            }
++            for (int64_t ik = 0; ik < n_kv; ++ik) {
++                const bool visible = ik <= pos && ((ik >= n_lead && ik < n_lead + n_prefix) || ik >= start[s]);
++                data[(i23*n_q + iq)*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
++            }
++        }
++    }
++    ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
++}
++
+ static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
+     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+     GGML_ASSERT(n_kv_max > 0 && n_kv_max <= tensor->ne[0]);
+@@ -9063,9 +9104,20 @@ struct test_flash_attn_ext : public test_case {
+     const int64_t n_kv_max;
+     const int64_t q_head_padding;
+     const int64_t mask_heads;
++    const int64_t n_seq_diag;    // if > 0: causal mask of this many sequences of unequal length that share the K/V slice
++    const int64_t n_prefix_diag; // with n_seq_diag: K/V positions before the sequences that every query sees
++    const int64_t n_lead_diag;   // with n_seq_diag: K/V positions before the prefix that no query sees
+ 
+     std::string vars() override {
+-        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, q_head_padding) + ",mask_heads=" + std::to_string(mask_heads);
++        std::string s = VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, q_head_padding) +
++            ",mask_heads=" + std::to_string(mask_heads);
++        if (n_seq_diag > 0) {
++            s += ",n_seq_diag=" + std::to_string(n_seq_diag) + ",n_prefix_diag=" + std::to_string(n_prefix_diag);
++        }
++        if (n_lead_diag > 0) {
++            s += ",n_lead_diag=" + std::to_string(n_lead_diag);
++        }
++        return s;
+     }
+ 
+     double max_nmse_err() override {
+@@ -9082,9 +9134,11 @@ struct test_flash_attn_ext : public test_case {
+     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
+                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
+                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int64_t q_head_padding = 0, int64_t mask_heads = 1)
++                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int64_t q_head_padding = 0, int64_t mask_heads = 1,
++                        int64_t n_seq_diag = 0, int64_t n_prefix_diag = 0, int64_t n_lead_diag = 0)
+         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), q_head_padding(q_head_padding), mask_heads(mask_heads) {}
++          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), q_head_padding(q_head_padding), mask_heads(mask_heads),
++          n_seq_diag(n_seq_diag), n_prefix_diag(n_prefix_diag), n_lead_diag(n_lead_diag) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
+@@ -9177,6 +9231,8 @@ struct test_flash_attn_ext : public test_case {
+                     ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+                 } else if (n_kv_max > 0) {
+                     init_tensor_kq_mask_sparse(t, n_kv_max);
++                } else if (n_seq_diag > 0) {
++                    init_tensor_kq_mask_seq_diag(t, n_seq_diag, n_prefix_diag, n_lead_diag);
+                 } else {
+                     init_tensor_kq_mask(t);
+                 }
+@@ -9241,11 +9297,17 @@ struct test_flash_attn_ext_kv_rows : public test_case {
+     const int64_t nb;       // queries per slice
+     const int64_t n_slices;
+     const ggml_type type_KV;
++    const int64_t n_seq_diag;    // if > 0: the list positions hold this many sequences, see init_tensor_kq_mask_seq_diag
++    const int64_t n_prefix_diag;
+ 
+     std::vector<int32_t> rows;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR8(hs, nh, gqa, n_cells, kv, nb, n_slices, type_KV);
++        std::string s = VARS_TO_STR8(hs, nh, gqa, n_cells, kv, nb, n_slices, type_KV);
++        if (n_seq_diag > 0) {
++            s += ",n_seq_diag=" + std::to_string(n_seq_diag) + ",n_prefix_diag=" + std::to_string(n_prefix_diag);
++        }
++        return s;
+     }
+ 
+     double max_nmse_err() override {
+@@ -9253,8 +9315,12 @@ struct test_flash_attn_ext_kv_rows : public test_case {
+     }
+ 
+     test_flash_attn_ext_kv_rows(int64_t hs = 256, int64_t nh = 2, int64_t gqa = 8, int64_t n_cells = 2048, int64_t kv = 512,
+-                                int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16)
+-        : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV) {}
++                                int64_t nb = 8, int64_t n_slices = 4, ggml_type type_KV = GGML_TYPE_F16,
++                                int64_t n_seq_diag = 0, int64_t n_prefix_diag = 0)
++        : hs(hs), nh(nh), gqa(gqa), n_cells(n_cells), kv(kv), nb(nb), n_slices(n_slices), type_KV(type_KV),
++          n_seq_diag(n_seq_diag), n_prefix_diag(n_prefix_diag) {
++        GGML_ASSERT(n_seq_diag == 0 || n_slices == 1);
++    }
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_slices);
+@@ -9305,6 +9371,8 @@ struct test_flash_attn_ext_kv_rows : public test_case {
+             }
+             if (strcmp(t->name, "r") == 0) {
+                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
++            } else if (strcmp(t->name, "m") == 0 && n_seq_diag > 0) {
++                init_tensor_kq_mask_seq_diag(t, n_seq_diag, n_prefix_diag);
+             } else if (strcmp(t->name, "m") == 0) {
+                 std::vector<float> f(ggml_nelements(t));
+                 std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+@@ -13195,6 +13263,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // sequences of unequal length in one K/V slice, the leading fully masked K/V blocks of a query tile can be skipped
++    // (the MMA kernel skips them with GQA on Ampere or newer; nr23 {1, 1} covers the kernels that do not skip)
++    for (int64_t n_seq : {1, 5, 9}) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 2048, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq));
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1}, 2560, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq));
++        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 1536, 1536, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq));
++        // the sequences continue a shared prefix: the K/V blocks of the other sequences in between are fully masked
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 2304, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq, 96));
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 2560, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq, 300));
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 2560, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq, 300));
++        // fully masked K/V blocks before the prefix too: the first visible block is not block 0
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 2560, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq, 96, 256));
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 3072, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq, 96, 1024));
++    }
++
+     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+@@ -13277,6 +13360,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
+         }
+     }
++    // one list for several sequences of unequal length, e.g. rerank documents after a shared query: fully masked K/V ranges
++    for (int64_t nb : {256, 512}) {
++        for (int64_t n_prefix : {0, 96}) {
++            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(128, 8, 2, 4096, 2048, nb, 1, GGML_TYPE_F16, 9, n_prefix));
++            test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4096, 2048, nb, 1, GGML_TYPE_F16, 9, n_prefix));
++        }
++    }
+ 
+     // sparse mask with large batch size
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+@@ -14038,6 +14128,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // Same non-causal vision-encoder shape for the other head size padded in-kernel by the CUDA MMA kernels
+     test_cases.emplace_back(new test_flash_attn_ext(40, 40, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
++    // Prefill of sequences of unequal length in one K/V slice (e.g. rerank documents), n_seq_diag=1 is one causal sequence
++    for (int64_t n_seq : {1, 9}) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 2048, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, n_seq));
++    }
++    // the sequences continue a shared prefix (e.g. rerank documents after a shared query)
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, 2304, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, 9, 96));
++    // one causal sequence at the end of a long context, the usual long prefill ubatch
++    for (int64_t kv : {4096, 8192, 32768}) {
++        for (int64_t nq : {1024, 2048}) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, nq, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 1, 1));
++        }
++    }
++
+     // Sparse flash attention (n_kv_max hint) decode across KV depths.
+     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
+     for (int64_t kv : {4096, 16384, 32768}) {
